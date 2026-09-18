@@ -1,0 +1,108 @@
+SEARCH FEATURE — IMPLEMENTATION PLAN
+Movie Explorer (Next.js 16 App Router, React 19)
+
+Context / current state (verified before planning)
+- Routing: Next.js App Router. Pages live under app/ :
+    app/page.tsx            landing page, async Server Component, calls getPopularMovies()
+    app/movies/[id]/page.tsx detail page, async Server Component, params: Promise<{ id: string }>
+    app/layout.tsx            root layout, imports app/globals.css
+- TMDB access is SERVER-SIDE only. lib/tmdb.ts has a shared tmdbFetch<T>() helper that
+  reads process.env.TMDB_API_TOKEN, sets a Bearer header, and does next: { revalidate: 3600 }.
+  No API route (app/**/route.ts) exists yet. The token is a server secret, so search must be
+  fetched server-side and exposed through a route handler, never called directly from the browser.
+- UI is reusable:
+    components/MovieGrid.tsx  takes { movies: Movie[] }, renders MovieCard, already prints
+                              "No movies found." when the array is empty (reused for the empty state).
+    components/MovieCard.tsx  a next/link Link to `/movies/${movie.id}` (the existing detail route).
+- Styling: plain, class-based CSS in app/globals.css (dark theme). Tailwind is installed but unused;
+  follow the existing plain-CSS convention.
+- No "use client" client components exist anywhere yet.
+- Pre-existing quirk: lib/tmdb.ts imports from "@/types/movie" while the file on disk is
+  types/movies.ts. Do NOT "fix" this; just keep using the existing Movie / MovieResponse types.
+  The TMDB /search/movie response already matches MovieResponse (page, results, total_pages,
+  total_results), so no new types are required.
+
+Notes on Next 16 specifics (from AGENTS.md: "this is NOT the Next.js you know")
+- Before writing the route handler (Step 2) and the search page (Step 4), skim the relevant guide
+  under node_modules/next/dist/docs/ for route-handler signatures and client-component rules, and
+  heed any deprecation notices.
+- Avoid next/navigation's useSearchParams(); in this Next version it requires a <Suspense>
+  boundary. Instead keep the query in React component state so no Suspense is needed.
+
+--- SEQUENTIAL STEPS (each implementable and verifiable independently) ---
+
+1. Add a server-side search function to the TMDB utility.
+   - In lib/tmdb.ts add `export async function searchMovies(query: string, page = 1):
+     Promise<MovieResponse>`, mirroring getPopularMovies(). It should call the existing
+     tmdbFetch<T>(...) helper with the path
+     `/search/movie?language=en-US&page=${page}&query=${encodeURIComponent(query)}`.
+     Reuse the existing MovieResponse return type — do not add new types.
+   - Verify: run `pnpm lint` (or `pnpm lint -- lib/tmdb.ts`). Confirm no type/compile errors.
+     The function is pure (delegates to tmdbFetch), so it is correct once it type-checks; a real
+     call is exercised end-to-end in Step 5.
+
+2. Expose the search through a route handler (keeps the token server-side).
+   - Create app/api/search/route.ts exporting a GET handler. It reads the query from the URL
+     search params (`request` -> `new URL(request.url).searchParams.get("q")`, plus optional
+     "page"), validates that `q` is present and non-empty (return HTTP 400 with a JSON error body
+     otherwise), calls searchMovies(q, page), and returns the result as JSON. Wrap the call so a
+     TMDB failure surfaces as HTTP 500 with a JSON error message rather than an unhandled throw.
+     (Confirm the Next 16 route-handler signature in node_modules/next/dist/docs/ first.)
+   - Verify: with `pnpm dev` running, curl the endpoint:
+       curl "http://localhost:3000/api/search?q=batman"
+       curl "http://localhost:3000/api/search"            (expect 400)
+     Confirm a 200 with a JSON "results" array for a valid query and a 400 for a missing query.
+
+3. Add "Search" navigation to the landing page.
+   - In app/page.tsx add a next/link Link to `/search` near the existing header/grid so it reads
+     as native to the layout (e.g., in the .page-header block, a "Search movies" link/button to the
+     right of the heading, or a bar just above the MovieGrid). Keep it a Server Component; only the
+     <Link> is added, no "use client".
+   - Verify: `pnpm dev`, open the landing page, confirm the Search control is visible and that
+     clicking it navigates to /search (route must exist or Next will 404 — Step 4 creates it).
+
+4. Build the search page as a Client Component with loading/empty/error states.
+   - Create app/search/page.tsx with the "use client" directive. It should render:
+       * a text input + submit (a <form> for Enter-to-search, or an input + Search button),
+       * a back link to "/" reusing the existing .back-link style for consistency,
+       * a results area that renders <MovieGrid movies={...} /> (reuses MovieCard, so results
+         match the landing grid and clicks go to /movies/[id] automatically).
+     Keep state in component variables: query, results (Movie[]), loading (bool), error (string|null),
+     and a "hasSearched" flag. On submit: set loading=true, fetch
+     `GET /api/search?q=${encodeURIComponent(query)}` (and optional &page=), branch on
+     response.ok, map the JSON to { results, total_results }, then set states. Use an effect/abort
+     (AbortController or ignore-flag) so a slow stale request can't overwrite a newer one.
+     Render the states explicitly:
+       - No query yet (hasSearched false): an idle prompt like "Search for a movie".
+       - Loading: a "Searching..." indicator / spinner.
+       - Error (fetch fails or response not ok): a message, e.g. "Search failed. Please try again."
+       - Empty results (hasSearched true, results.length === 0): a "No movies found for '<q>'"
+         message. (MovieGrid already prints "No movies found." for empty arrays, so the empty case
+         can simply pass [] to MovieGrid or render the message directly — pick one and stay consistent.)
+     Wrap the page in the existing .container for layout parity.
+   - Verify: `pnpm dev`, go to /search. Check each state independently:
+       * blank input (idle prompt),
+       * a real query (e.g. "inception") -> results grid renders,
+       * a nonsense query -> "no results" empty state,
+       * simulate failure (stop the dev server or use an unreachable token) -> error state,
+       * confirm the loading indicator appears during the fetch.
+
+5. Confirm result clicks reuse the existing detail page.
+   - No new code is required: MovieGrid -> MovieCard already links to /movies/${id}, the same route
+     used from the landing grid, so clicking any search result opens the existing detail page.
+   - Verify: from /search results, click a card and confirm it opens the same detail page
+     (overview, trailer, images) as clicking a card on the landing page.
+
+6. Style the search UI to match the existing dark theme.
+   - In app/globals.css add classes for the search form/input/button and the loading/empty/error
+     messages, following the existing naming and dark-theme conventions (e.g. reuse the look of
+     .page-header, .back-link, and card surfaces). Keep changes scoped to the search page.
+   - Verify: visually confirm the search bar, button, and states look native alongside the landing
+     grid, and that they reflow correctly in the existing @media (max-width: 700px) mobile block.
+
+7. End-to-end and quality gate.
+   - Run `pnpm lint` and `pnpm build` clean. Then run `pnpm dev` and exercise the full flow:
+     landing -> click Search -> type a query -> results reuse MovieCard -> click a result ->
+     detail page -> back to /search -> try empty and error states.
+   - Verify: build + lint pass with no warnings in the changed files; the complete user journey
+     works and the token is never sent to the browser (only the /api/search route calls TMDB).
